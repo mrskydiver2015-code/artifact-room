@@ -42,7 +42,7 @@
   #prompt b{font-family:'IM Fell English',serif;color:#e4b96b;font-weight:normal}
   #prompt .k{display:inline-block;border:1px solid rgba(216,198,156,.5);border-radius:3px;
     padding:0 6px;margin:0 3px;font-size:12.5px;color:#d8c69c}
-  #toast{position:absolute;bottom:154px;left:50%;transform:translateX(-50%);
+  #toast{position:fixed;z-index:100;bottom:154px;left:50%;transform:translateX(-50%);
     padding:6px 14px;border-radius:3px;background:rgba(24,17,9,.9);
     border:1px solid rgba(122,43,30,.7);color:#e0c9a0;font-size:14px;font-style:italic;
     opacity:0;transition:opacity .35s;pointer-events:none;max-width:86vw;text-align:center}
@@ -247,12 +247,12 @@
     <button class="rbtn" id="resetBtn" title="Return to the door" aria-label="Reset position">&#8634;</button>
   </div>
   <div id="prompt"></div>
-  <div id="toast"></div>
   <div id="walkBar"><span id="wbText"></span><button id="wbOpen">Open now</button><button id="wbCancel">&#10005;</button></div>
   <div id="roomTitle">THE ARTIFACT ROOM<span>EST. MMXXVI</span></div>
   <div id="joy"><div id="joyKnob"></div></div>
   <button id="examineBtn">Open</button>
 </div>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <!-- item detail card -->
 <div class="ovWrap" id="cardWrap" role="dialog" aria-modal="true">
@@ -606,7 +606,7 @@ function seedState(){
 
 /* ---------- store (local-first, graceful in sandboxed previews) ---------- */
 const STORE_KEY="artifact-room-v2";
-let DB=null, storageOk=true, warnedStorage=false;
+let DB=null, storageOk=true;
 function loadState(){
   try{
     const raw=localStorage.getItem(STORE_KEY);
@@ -632,10 +632,14 @@ function loadState(){
   return seedState();
 }
 function saveState(){
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }
+  try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); storageOk=true; return true; }
   catch(e){ storageOk=false;
-    if(!warnedStorage){ warnedStorage=true;
-      toast("Saved for this session only here — open the file locally or deployed for full saving."); } }
+    const full=e && (e.name==="QuotaExceededError" || e.name==="NS_ERROR_DOM_QUOTA_REACHED");
+    toast(full
+      ? "Storage is full. Changes are kept only in this session and will be lost on reload."
+      : "Could not save to this browser. Changes are kept only in this session and will be lost on reload.",6000,true);
+    return false;
+  }
 }
 DB=loadState();
 function findItem(id){ for(const c of DB.collections){ const it=c.items.find(i=>i.id===id); if(it) return {col:c,item:it}; } return null; }
@@ -661,6 +665,33 @@ renderer.toneMappingExposure=1.18;
 stage.appendChild(renderer.domElement);
 
 const scene=new THREE.Scene();
+/* Persistent resources survive temporary scene removals (including an empty constellation). */
+const sharedResources=new WeakSet();
+function removeSceneObjects(objects){
+  const candidates=new Set(), retained=new Set();
+  function collect(root,resources){
+    root.traverse(obj=>{
+      /* Three.js sprites share an internal geometry, even across future sprites. */
+      if(obj.geometry && !obj.isSprite) resources.add(obj.geometry);
+      const materials=Array.isArray(obj.material)?obj.material:[obj.material];
+      materials.forEach(mat=>{
+        if(!mat) return;
+        resources.add(mat);
+        Object.values(mat).forEach(value=>{ if(value && value.isTexture) resources.add(value); });
+      });
+    });
+  }
+  objects.forEach(obj=>{
+    if(!obj) return;
+    collect(obj,candidates);
+    if(obj.parent) obj.parent.remove(obj);
+  });
+  /* Protect resources still used by another live object, including cloned meshes. */
+  collect(scene,retained);
+  candidates.forEach(resource=>{
+    if(!sharedResources.has(resource) && !retained.has(resource)) resource.dispose();
+  });
+}
 scene.background=new THREE.Color(0x0d0a07);
 scene.fog=new THREE.Fog(0x14100a,12,34);
 const camera=new THREE.PerspectiveCamera(58,innerWidth/innerHeight,0.1,60);
@@ -699,6 +730,7 @@ const M={
   black:   new THREE.MeshStandardMaterial({color:0x141210,roughness:.8}),
   ghost:   new THREE.MeshBasicMaterial({transparent:true,opacity:0,depthWrite:false})
 };
+Object.values(M).forEach(material=>sharedResources.add(material));
 
 /* ---------- floor ---------- */
 const floorTex=canvasTex(512,512,(g)=>{
@@ -1061,9 +1093,9 @@ const gadgets={}; // seedKey -> {mesh, group}
 /* ---------- item rendering on shelves ---------- */
 let itemInteract=[];      // {mesh,itemId,colId,label}
 function clearItemMeshes(){
-  itemInteract.forEach(it=>{ if(it.label){ scene.remove(it.label); } });
+  removeSceneObjects(itemInteract.map(it=>it.label).concat(...ANCHORS.map(a=>a.artGroup?a.artGroup.children.slice():[])));
   itemInteract=[];
-  ANCHORS.forEach(a=>{ if(a.artGroup){ a.artGroup.children.slice().forEach(c=>a.artGroup.remove(c)); } });
+  addGhostMats.length=0;
 }
 function makeItemMesh(item,style){
   const g2=new THREE.Group();
@@ -1145,9 +1177,14 @@ function makeAddGhost(){
 }
 function rebuildAnchorBooks(a){
   if(!a.built) return;
-  a.artGroup.children.slice().forEach(c=>a.artGroup.remove(c));
+  const removed=a.artGroup.children.slice();
+  a.artGroup.traverse(obj=>{
+    const i=addGhostMats.indexOf(obj.material);
+    if(i>=0) addGhostMats.splice(i,1);
+  });
   itemInteract=itemInteract.filter(it=>{
-    if(it.anchorIdx===a.idx){ if(it.label) scene.remove(it.label); return false; } return true; });
+    if(it.anchorIdx===a.idx){ if(it.label) removed.push(it.label); return false; } return true; });
+  removeSceneObjects(removed);
   const col=colByAnchor(a.idx);
   const rnd=mulberry32(hashStr(col?col.id:("empty"+a.idx)));
   function hold(grp,obj){ const h=new THREE.Group();
@@ -1342,7 +1379,7 @@ function guestTargets(){
 }
 function speakText(gu,text){
   if(!gu || !gu.g.visible) return;
-  if(gu.speech){ scene.remove(gu.speech.s); }
+  if(gu.speech){ removeSceneObjects([gu.speech.s]); }
   const sp=labelSprite("\u201c"+text+"\u201d"); sp.visible=true; scene.add(sp);
   gu.speech={s:sp,t:4};
 }
@@ -1360,7 +1397,7 @@ const GUEST_DIALOG=[
 let chatTimer=9;
 let playerTag=null;
 function setPlayerTag(){
-  if(playerTag){ scene.remove(playerTag); playerTag=null; }
+  if(playerTag){ removeSceneObjects([playerTag]); playerTag=null; }
   const n=DB&&DB.guestName;
   if(n){ playerTag=labelSprite(n,"brass"); playerTag.visible=true; scene.add(playerTag); }
 }
@@ -1395,7 +1432,7 @@ function updateGuests(dt){
     gu.g.visible=on; gu.tag.visible=on;
     if(gu.speech){ gu.speech.t-=dt;
       gu.speech.s.position.set(gu.g.position.x,gu.seat?2.15:2.5,gu.g.position.z);
-      if(gu.speech.t<=0 || !on){ scene.remove(gu.speech.s); gu.speech=null; } }
+      if(gu.speech.t<=0 || !on){ removeSceneObjects([gu.speech.s]); gu.speech=null; } }
     if(!on){ if(gu.seat) standUp(gu); return; }
     gu.tag.position.set(gu.g.position.x,gu.seat?1.8:2.12,gu.g.position.z);
     if(gu.idle>0){ gu.idle-=dt;
@@ -1478,10 +1515,11 @@ const plinthGroup=new THREE.Group(); scene.add(plinthGroup);
 let plinthSpins=[], plinthHalos=[];
 addCollider(-4.4,2.4,0.5); addCollider(4.4,2.4,0.5);
 function buildPlinths(){
-  plinthGroup.children.slice().forEach(c=>plinthGroup.remove(c));
+  const removed=plinthGroup.children.slice();
   plinthSpins=[]; plinthHalos=[];
   itemInteract=itemInteract.filter(it=>{
-    if(it.anchorIdx==="plinth"){ if(it.label) scene.remove(it.label); return false; } return true; });
+    if(it.anchorIdx==="plinth"){ if(it.label) removed.push(it.label); return false; } return true; });
+  removeSceneObjects(removed);
   const sorted=DB.collections.filter(c=>c.items.length>0)
     .slice().sort((a,b)=>b.items.length-a.items.length);
   const all=[]; DB.collections.forEach(c2=>c2.items.forEach(it2=>all.push({col:c2,item:it2})));
@@ -1538,6 +1576,7 @@ const starTex=canvasTex(64,64,(g)=>{
   rg.addColorStop(1,"rgba(255,200,110,0)");
   g.fillStyle=rg; g.fillRect(0,0,64,64);
 });
+sharedResources.add(starTex);
 function constLayout(){
   const per=[]; const cols=DB.collections.filter(c=>c.items.length);
   const C=new THREE.Vector3(0,3.45,-1.0);
@@ -1582,12 +1621,11 @@ function setConstellation(on){
       CONST.stars.push({m,o,tgt:e2.pos,p:0,delay:i*0.045,col:e2.col});
     });
     /* constellation lines per collection */
-    const lm=new THREE.LineBasicMaterial({color:0xc9a86a,transparent:true,opacity:0});
     cols.forEach(c=>{
       const pts=CONST.stars.filter(st2=>st2.col===c).map(st2=>st2.tgt);
       if(pts.length<2) return;
       const geo=new THREE.BufferGeometry().setFromPoints(pts);
-      const ln=new THREE.Line(geo,lm.clone()); ln.renderOrder=19;
+      const ln=new THREE.Line(geo,new THREE.LineBasicMaterial({color:0xc9a86a,transparent:true,opacity:0})); ln.renderOrder=19;
       scene.add(ln); CONST.lines.push(ln);
     });
     /* cluster titles */
@@ -1610,9 +1648,7 @@ function setConstellation(on){
   }
 }
 function constCleanup(){
-  CONST.stars.forEach(st2=>scene.remove(st2.m));
-  CONST.lines.forEach(l2=>scene.remove(l2));
-  CONST.labels.forEach(l2=>scene.remove(l2));
+  removeSceneObjects(CONST.stars.map(st2=>st2.m).concat(CONST.lines,CONST.labels));
   CONST.stars=[]; CONST.lines=[]; CONST.labels=[];
   CONST.on=false; CONST.closing=false;
 }
@@ -2479,9 +2515,12 @@ function activateZone(z){
 }
 
 /* ---------- UI: toast ---------- */
-let toastT=null;
-function toast(msg){ toastEl.textContent=msg; toastEl.style.opacity=1;
-  clearTimeout(toastT); toastT=setTimeout(()=>toastEl.style.opacity=0,2200); }
+let toastT=null, priorityToastUntil=0;
+function toast(msg,duration=2200,priority=false){
+  if(!priority && Date.now()<priorityToastUntil) return;
+  if(priority) priorityToastUntil=Date.now()+duration;
+  toastEl.textContent=msg; toastEl.style.opacity=1;
+  clearTimeout(toastT); toastT=setTimeout(()=>toastEl.style.opacity=0,duration); }
 
 /* ---------- UI: detail card ---------- */
 let cardItemId=null;
@@ -2525,7 +2564,7 @@ let sheetColId=null, sheetEdit=false, sheetFilter=null;
 function openSheet(colId){
   sheetColId=colId; sheetEdit=false; sheetFilter=null;
   DB.last=colId;
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+  saveState();
   renderSheet();
   $("sheetWrap").style.display="flex";
 }
@@ -2563,7 +2602,9 @@ function renderSheet(){
     const ti=document.createElement('div'); ti.className="ir-title"; ti.textContent=item.title;
     const sub=document.createElement('div'); sub.className="ir-sub";
     sub.style.setProperty('--sc',item.sColor||"#4a3a28");
-    sub.innerHTML=(item.kind?item.kind+" · ":"")+"<b>"+(item.status||"")+"</b>";
+    sub.textContent=item.kind?item.kind+" · ":"";
+    const status=document.createElement('b'); status.textContent=item.status||"";
+    sub.appendChild(status);
     main.appendChild(ti); main.appendChild(sub); row.appendChild(main);
     if(sheetEdit){
       const eb=document.createElement('button'); eb.className="rowBtn"; eb.innerHTML="&#9998;";
@@ -2674,7 +2715,7 @@ function setMusic(on){
     clearTimeout(musicTimer); musicNote();
   } else clearTimeout(musicTimer);
   DB.music=on;
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+  saveState();
 }
 function bdRender(){
   const list=$("bdList"); list.innerHTML="";
@@ -2707,7 +2748,7 @@ $("bdPin").addEventListener('click',()=>{
   DB.notes=DB.notes||[];
   DB.notes.unshift({n:(DB.guestName||"Anonymous"),txt,ts:Date.now()});
   DB.notes=DB.notes.slice(0,12);
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+  saveState();
   bdRender(); $("bdText").value="";
   toast("Pinned to the board.");
 });
@@ -2827,7 +2868,7 @@ function openIndex(){
   const visBtn=document.createElement('button'); visBtn.className="inkLink";
   visBtn.textContent="Visitors: "+(DB.visitors!==false?"on":"off");
   visBtn.onclick=()=>{ DB.visitors=!(DB.visitors!==false);
-    try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+    saveState();
     visBtn.textContent="Visitors: "+(DB.visitors!==false?"on":"off"); };
   info.appendChild(infoTxt); info.appendChild(visBtn);
   list.appendChild(info);
@@ -2952,7 +2993,7 @@ $("resetBtn").addEventListener('click',()=>{
 $("helpBtn").addEventListener('click',()=>{ welcome.style.display="flex"; welcome.style.opacity=1; });
 $("enterBtn").addEventListener('click',()=>{
   DB.guestName=($("guestName").value||"").trim();
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+  saveState();
   setPlayerTag();
   state.camDist=7.6;
   if(DB.music) setMusic(true);
@@ -2962,7 +3003,7 @@ $("enterBtn").addEventListener('click',()=>{
   DB.visitLog.unshift({ts:Date.now(),
     items:DB.collections.reduce((n2,c2)=>n2+c2.items.length,0)});
   DB.visitLog=DB.visitLog.slice(0,10);
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+  saveState();
   setTimeout(()=>{
     if(DB.visitors===false || !guests.length) return;
     let ng=guests[0], bd2=1e9;
@@ -3003,7 +3044,7 @@ function setPlayerColor(hex){
     b.style.cssText="width:34px;height:34px;border-radius:50%;border:1px solid #6d5230;cursor:pointer;background:"+c;
     b.setAttribute('aria-label','Coat colour '+c);
     b.onclick=()=>{ DB.playerColor=c;
-      try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+      saveState();
       setPlayerColor(c); };
     row.appendChild(b);
   }); })();
@@ -3125,8 +3166,13 @@ function animate(){
   state.nearestZone=bz;
   activePlaque=null;
   if(bz){
-    if(bz.t==="col"){ activePlaque=bz.anchor.plaqueMesh; }
-    else { activePlaque=bz.frame.plane; }
+    switch(bz.t){
+      case "col":
+      case "claim": activePlaque=bz.anchor && bz.anchor.plaqueMesh || null; break;
+      case "frame": activePlaque=bz.frame && bz.frame.plane || null; break;
+      case "board": break; // The board has no emissive highlight target.
+      default: break; // Unknown zones must never interrupt rendering.
+    }
     promptEl.innerHTML= IS_TOUCH
       ? "<b>"+escapeHtml(bz.name)+"</b>"
       : "<b>"+escapeHtml(bz.name)+"</b> &nbsp;<span class='k'>E</span> step up · <span class='k'>R</span> "+(bz.t==="col"?"open":(bz.t==="claim"?"claim":(bz.t==="board"?"read":"view")));
@@ -3135,9 +3181,10 @@ function animate(){
   } else {
     promptEl.style.display="none"; examineBtn.style.display="none";
   }
-  if(prevPlaque && prevPlaque!==activePlaque && prevPlaque.material.emissiveIntensity!==undefined)
+  if(prevPlaque && prevPlaque!==activePlaque && prevPlaque.material && prevPlaque.material.emissiveIntensity!==undefined)
     prevPlaque.material.emissiveIntensity=0;
-  if(activePlaque) activePlaque.material.emissiveIntensity=0.22+Math.sin(t*4)*0.1;
+  if(activePlaque && activePlaque.material && activePlaque.material.emissiveIntensity!==undefined)
+    activePlaque.material.emissiveIntensity=0.22+Math.sin(t*4)*0.1;
 
   /* item glow: hover (desktop) + close proximity */
   for(const it of itemInteract){
